@@ -6,7 +6,7 @@ It's for the moment you think "I installed something for this last month… what
 
 ![The dashboard: live CPU, swap, disk and temperature, a bar showing which apps use your RAM, and the processes and Docker containers using memory right now](docs/dashboard.png)
 
-- **Browser, TUI or command line.** The same inventory, explanations and actions as a web dashboard, a full-screen terminal app (`machinemap tui`), or one-off commands.
+- **Browser or terminal.** The same inventory, explanations and actions as a web dashboard or a full-screen terminal app (`machinemap tui`).
 - **One file, no dependencies.** Python 3.9+ standard library only. No pip install, no Node, no Electron.
 - **Light.** The server idles at about 30 MB of RAM and quits on its own 3 minutes after you close the tab.
 - **Explains before it acts.** Every item has a "What is this?" panel: what it does, how to use it (from `tldr` or its own help), how you installed it (matched from your shell history), and whether removing it is safe, risky or system-critical.
@@ -34,6 +34,8 @@ python3 machinemap.py
 | --- | --- |
 | `machinemap` | Opens the dashboard in your browser |
 | `machinemap --no-open` | Starts the server without opening a browser |
+| `machinemap tui` | Opens the full-screen terminal app |
+| `machinemap --print` | Prints the whole inventory as plain text (pipe it into `grep`) |
 | `MACHINEMAP_PORT=8080 machinemap` | Uses another port (default 7171) |
 
 ### Full-screen terminal app
@@ -60,31 +62,6 @@ The dashboard as a terminal app, like htop or lazydocker. Live gauges and a RAM 
 | `q` | Quit |
 
 Actions and AI answers leave full-screen mode while they run, so you see their output and can type your password, then press Enter to go back.
-
-### Single commands
-
-Everything also works as one-off commands, handy for scripts:
-
-```bash
-machinemap list                    # every section with its count
-machinemap list docker ports       # what's in those sections
-machinemap search scraper          # names, paths, tags and your notes
-machinemap info ollama             # what it is, how to use it, is it safe to remove
-machinemap top --watch 2           # live RAM and CPU by app, like a friendlier htop
-machinemap do twenty-server-1      # list its actions…
-machinemap do twenty-server-1 Stop # …and run one, by name or number
-machinemap ask lsd --with local    # explain it with your local Ollama model
-machinemap note copyq "clipboard history, keep it"
-machinemap updates                 # available updates (apt, flatpak, npm)
-machinemap cleanup                 # caches that are safe to clear, with sizes
-machinemap removed                 # what you removed, and how to get it back
-```
-
-- **Section names:** `docker`, `ports`, `services`, `startup`, `bin`, `pipx`, `npm`, `apt`, `flatpak`, `apps`, `extensions`, `claude`, `mcp`, `ollama`, `repos` or `history`.
-- **When a name matches several items,** it asks which one; add `--in SECTION` to narrow it down.
-- **`do`** shows the same risk warning, dry run and undo as the dashboard, then asks before running. `--yes` skips the question, except for system-critical items. Admin actions ask for your password in the terminal.
-- **For scripts:** `list`, `search`, `info` and `top` take `--json`. Plain output is one item per line when piped, so `grep` works.
-- **Colors:** set `NO_COLOR=1` to turn them off.
 
 In the page:
 
@@ -143,8 +120,9 @@ Your notes, the log of things you removed, and saved explanations live in `~/.co
 
 ## Security
 
-- **Only you can open it.** The server listens on `127.0.0.1` only, but other accounts on the machine (and containers using host networking) can reach that too. So the page opens only through the link the launcher makes: it carries a secret kept in a file only you can read (`$XDG_RUNTIME_DIR/machinemap-7171.token`), which your browser then keeps as a cookie. Every API request needs that secret as well.
+- **Only you can open it.** The server listens on `127.0.0.1` only, but other accounts on the machine (and containers using host networking) can reach that too. So the launcher never puts a secret in a URL or command line, where other users could read it. Instead it opens a private page (readable only by you, in `$XDG_RUNTIME_DIR`) holding a one-time code that expires after two minutes. The server swaps that code for the session secret, which only that browser tab keeps. Every API request needs the secret, and the launcher refuses to connect if another user's program holds the port.
 - **Websites can't use it.** Requests carrying another site's `Host`, `Origin` or `Sec-Fetch-Site` are refused, and the page can't be framed by other sites.
+- **Your terminal is protected.** In the terminal app, control characters are stripped from names, commands, help output and AI answers, so a crafted file name can't send escape sequences to your terminal.
 - **It never runs your programs on its own.** Usage notes come from `tldr`, man pages or a script's own comments. A program's `--help` runs only when you press the button for it, since a program may ignore `--help` and just run.
 - **Secrets stay hidden.** Passwords, tokens and API keys in your shell history, process command lines and MCP configs are shown as `•••`. They're masked again in anything sent to an AI.
 - **AI answers can't take actions.** Facts sent to an AI are marked as data to describe, never instructions, and the built-in Claude CLI provider runs with tools turned off. If you add your own `command` provider, use one with tools disabled too, because READMEs from repos you cloned end up in the prompt.
