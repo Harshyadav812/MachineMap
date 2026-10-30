@@ -6,7 +6,7 @@ It's for the moment you think "I installed something for this last month… what
 
 ![The dashboard: live CPU, swap, disk and temperature, a bar showing which apps use your RAM, and the processes and Docker containers using memory right now](docs/dashboard.png)
 
-- **Dashboard and command line.** The same inventory, explanations and actions in your browser or your terminal.
+- **Browser, TUI or command line.** The same inventory, explanations and actions as a web dashboard, a full-screen terminal app (`machinemap tui`), or one-off commands.
 - **One file, no dependencies.** Python 3.9+ standard library only. No pip install, no Node, no Electron.
 - **Light.** The server idles at about 30 MB of RAM and quits on its own 3 minutes after you close the tab.
 - **Explains before it acts.** Every item has a "What is this?" panel: what it does, how to use it (from `tldr` or its own help), how you installed it (matched from your shell history), and whether removing it is safe, risky or system-critical.
@@ -36,9 +36,34 @@ python3 machinemap.py
 | `machinemap --no-open` | Starts the server without opening a browser |
 | `MACHINEMAP_PORT=8080 machinemap` | Uses another port (default 7171) |
 
-### In the terminal
+### Full-screen terminal app
 
-Everything the dashboard does also works as a command, without opening a browser:
+```bash
+machinemap tui
+```
+
+The dashboard as a terminal app, like htop or lazydocker. Live gauges and a RAM bar sit at the top, sections are on the left and their items on the right.
+
+| Key | What it does |
+| --- | --- |
+| `↑` `↓` or `j` `k`, `PgUp` `PgDn`, `g` `G` | Move |
+| `←` `→` or `Tab` | Switch between sections and items |
+| `Enter` | Open an item: what it is, how to use it, is it safe to remove |
+| `a` | Actions for the item. You see the same risk, dry run and undo as the dashboard before anything runs |
+| `A` | Bulk actions for the whole section, like "Update all flatpaks" |
+| `e` | Explain it with an AI |
+| `n` | Add or change your note |
+| `s` | Stop a process or container, in "Live: memory by app" |
+| `/`, `Esc` | Search everything, clear the search |
+| `r` | Rescan |
+| `?` | Show all keys |
+| `q` | Quit |
+
+Actions and AI answers leave full-screen mode while they run, so you see their output and can type your password, then press Enter to go back.
+
+### Single commands
+
+Everything also works as one-off commands, handy for scripts:
 
 ```bash
 machinemap list                    # every section with its count

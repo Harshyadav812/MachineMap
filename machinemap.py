@@ -2578,9 +2578,10 @@ def status(msg):
         print(dim(msg), file=sys.stderr)
 
 
-def load_inventory(extra=()):
+def load_inventory(extra=(), quiet=False):
     """Scans like the dashboard does; `extra` adds the slow on-demand sections (updates, cleanup, disk)."""
-    status("Scanning your machine…")
+    if not quiet:
+        status("Scanning your machine…")
     inv = CACHE["inventory"] = scan_all()
     for name in extra:
         status(f"Checking {name}…" + (" (uses the network)" if name == "updates" else ""))
@@ -2837,18 +2838,22 @@ def cmd_ask(args):
     hit = pick(inv, args.name, args.within)
     if not hit:
         die(f"Nothing called '{args.name}'. Try: machinemap search {args.name}")
-    iid = hit[1]["iid"]
-    status(f"Asking {local['model'] if target is None else provs[target]['name']}…" +
-           (" (loads it into RAM; the first words take a while on a laptop CPU)" if target is None else ""))
+    answer_in_terminal(hit[1]["iid"], target, args.fresh)
+
+
+def answer_in_terminal(iid, target, fresh=False):
+    """Streams an AI's explanation to the terminal; target None = the local Ollama model."""
+    print(dim(f"Asking {local_model()['model'] if target is None else ai_providers()[target]['name']}…" +
+              (" (loads it into RAM; the first words take a while on a laptop CPU)" if target is None else "")))
 
     def write(t):
         sys.stdout.write(t)
         sys.stdout.flush()
     try:
         if target is None:
-            stream_local(write, iid, args.fresh)
+            stream_local(write, iid, fresh)
         else:
-            stream_ai(write, iid, target, args.fresh)
+            stream_ai(write, iid, target, fresh)
     except KeyboardInterrupt:
         print(dim("\nStopped."))
     finally:
@@ -2907,6 +2912,507 @@ def cmd_top(args):
         pass
 
 
+class TUI:
+    """`machinemap tui`: the dashboard as a full-screen terminal app (curses, so still no dependencies)."""
+    HELP = "↑↓ move  ←→/Tab pane  Enter open  a actions  e explain  n note  / search  r rescan  ? help  q quit"
+
+    def __init__(self, scr, inv):
+        import curses
+        self.c, self.scr = curses, scr
+        curses.curs_set(0)
+        scr.keypad(True)
+        scr.timeout(1000)
+        try:
+            curses.use_default_colors()
+            for n, col in enumerate((curses.COLOR_CYAN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN), 1):
+                curses.init_pair(n, col, -1)
+            self.ACC, self.RED, self.YEL, self.GRN = (curses.color_pair(n) for n in range(1, 5))
+        except curses.error:
+            self.ACC = self.RED = self.YEL = self.GRN = 0
+        self.B, self.D, self.R = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
+        self.RISK = {"critical": self.RED | self.B, "caution": self.YEL | self.B, "safe": self.GRN | self.B, "info": self.D}
+        self.focus, self.sec, self.row, self.query, self.msg = 0, 0, 0, "", ""
+        self.live, self.live_at = LIVE.sample(), 0
+        self.reload(inv)
+
+    # ---- drawing helpers
+    def size(self):
+        return self.scr.getmaxyx()
+
+    def put(self, y, x, text, attr=0, width=None):
+        h, w = self.size()
+        if 0 <= y < h and 0 <= x < w:
+            width = min(width if width is not None else w - x, w - x - (1 if y == h - 1 else 0))
+            if width > 0:
+                try:
+                    self.scr.addnstr(y, x, str(text).replace("\n", " ").replace("\t", " "), width, attr)
+                except self.c.error:
+                    pass
+
+    def fill(self, y, x, width, attr):
+        self.put(y, x, " " * max(width, 0), attr, width)
+
+    @staticmethod
+    def fit(text, width):
+        text = str(text)
+        return text if len(text) <= width else text[:max(width - 1, 0)] + "…"
+
+    def ask_line(self, prompt, initial=""):
+        """A one-line text prompt at the bottom of the screen."""
+        h, w = self.size()
+        self.fill(h - 1, 0, w, self.R)
+        self.put(h - 1, 0, prompt, self.R | self.B)
+        self.c.echo()
+        self.c.curs_set(1)
+        self.scr.timeout(-1)
+        try:
+            raw = self.scr.getstr(h - 1, min(len(prompt), w - 2), 300)
+            return raw.decode(errors="replace").strip()
+        except (self.c.error, KeyboardInterrupt):
+            return None
+        finally:
+            self.c.noecho()
+            self.c.curs_set(0)
+            self.scr.timeout(1000)
+
+    def outside(self, fn):
+        """Leaves full-screen mode to run something that talks to you directly (actions, AI answers, passwords)."""
+        self.c.def_prog_mode()
+        self.c.endwin()
+        print()
+        try:
+            fn()
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        try:
+            input(dim("\nPress Enter to go back to Machine Map… "))
+        except (EOFError, KeyboardInterrupt):
+            pass
+        self.c.reset_prog_mode()
+        self.scr.clear()
+
+    # ---- data
+    def reload(self, inv):
+        self.inv, self.notes = inv, load_notes()
+        self.entries = [None] + [(g["title"], s) for g in inv["groups"] for s in g["sections"]]  # None = live view
+        self.sec = min(self.sec, len(self.entries) - 1)
+
+    def rescan(self):
+        self.msg = "Scanning your machine…"
+        self.draw()
+        self.reload(load_inventory(quiet=True))
+        self.msg = f"Scanned at {self.inv['scanned_at']} in {self.inv['took']}s"
+
+    def items(self):
+        """Rows of the right pane: (section, item), or ("proc"/"ctr", dict) in the live view."""
+        if self.query:
+            q = self.query.lower()
+            return [(s, i) for s, i in rows(self.inv) if q in " ".join(
+                (i["name"], i["detail"], i["path"], i["tag"], s["title"], self.notes.get(f"{s['id']}|{i['name']}", ""))).lower()]
+        e = self.entries[self.sec]
+        if e is None:
+            # containers come from their cgroups (exact); their processes are left out of the app list
+            return [("proc", p) for p in self.live["procs"] if not p["name"].startswith("docker: ")] + \
+                [("ctr", c) for c in self.live["containers"]]
+        return [(e[1], i) for i in e[1]["items"]]
+
+    # ---- screens
+    def draw(self):
+        self.scr.erase()
+        h, w = self.size()
+        d = self.live
+        used = d["mem_total"] - d["mem_avail"]
+        kb = lambda k: fmt_mb(k // 1024)
+        self.put(0, 1, "Machine Map", self.ACC | self.B)
+        x = 14
+        for label, val, pct in (("CPU", f"{d['cpu']:.0f}%", d["cpu"]),
+                                ("Swap", kb(d["swap_total"] - d["swap_free"]), 0),
+                                ("Disk", f"{d['disk_used'] / d['disk_total'] * 100:.0f}%", d["disk_used"] / d["disk_total"] * 100),
+                                ("Temp", f"{d['temp']:.0f}°C" if d["temp"] else "", d["temp"] or 0),
+                                ("Load", " ".join(d["load"]), 0)):
+            if val and x + len(label) + len(val) + 3 < w:
+                self.put(0, x, label, self.D)
+                self.put(0, x + len(label) + 1, val, self.B | (self.RED if pct > 85 else self.YEL if pct > 65 else 0))
+                x += len(label) + len(val) + 4
+        # where the RAM goes: one bar, biggest apps first
+        cap = f" {kb(used)} of {kb(d['mem_total'])} RAM used "
+        bw = max(w - len(cap) - 3, 10)
+        self.put(1, 1, cap, self.B)
+        bx, shown = 1 + len(cap), 0
+        for k, p in enumerate(d["procs"][:5]):
+            n = int(p["mem"] / d["mem_total"] * bw)
+            if n >= 1:
+                seg = self.fit(" " + p["name"], n) if n > 4 else ""
+                self.put(1, bx + shown, seg.ljust(n), self.R | (self.ACC if k % 2 == 0 else 0))
+                shown += n
+        rest = int(used / d["mem_total"] * bw) - shown
+        self.put(1, bx + shown, "▒" * max(rest, 0), self.D)
+        self.put(1, bx + shown + max(rest, 0), "·" * max(bw - shown - max(rest, 0), 0), self.D)
+        self.put(2, 0, "─" * w, self.D)
+
+        lw = max(min(34, w // 3), 16)
+        top, height = 3, h - 4
+        # left: sections, grouped
+        lines, last = [], None
+        for k, e in enumerate(self.entries):
+            if e is None:
+                lines.append((" Live: memory by app", k, self.B))
+                continue
+            if e[0] != last:
+                lines.append(("", None, 0))
+                lines.append((e[0], None, self.ACC | self.B))
+                last = e[0]
+            lines.append((f" {self.fit(e[1]['title'], lw - 8):<{lw - 7}}{len(e[1]['items']):>4}", k, self.D if not e[1]["items"] else 0))
+        sel_line = next((n for n, l in enumerate(lines) if l[1] == self.sec), 0)
+        start = max(0, min(sel_line - height // 2, len(lines) - height))
+        for n, (text, idx, attr) in enumerate(lines[start:start + height]):
+            if idx == self.sec and not self.query:
+                self.fill(top + n, 0, lw, self.R if self.focus == 0 else self.R | self.D)
+                self.put(top + n, 0, text, (self.R if self.focus == 0 else self.R | self.D) | self.B, lw)
+            else:
+                self.put(top + n, 0, text, attr, lw)
+        for y in range(top, h - 1):
+            self.put(y, lw, "│", self.D)
+
+        # right: items of the selected section, or search results, or live processes
+        rx, rw = lw + 2, w - lw - 3
+        its = self.items()
+        self.row = max(0, min(self.row, len(its) - 1))
+        e = self.entries[self.sec]
+        title = f'Search: "{self.query}"' if self.query else ("What is using memory right now" if e is None else e[1]["title"])
+        self.put(top, rx, title, self.B)
+        self.put(top, rx + len(title) + 2, str(len(its)), self.D)
+        hint = "" if self.query or e is None else e[1].get("hint", "")
+        self.put(top + 1, rx, self.fit(hint, rw), self.D)
+        body, bh = top + 2, height - 2
+        if not its:
+            self.put(body, rx, "Nothing here." if not self.query else "No matches. Press Esc to clear the search.", self.D)
+        start = max(0, min(self.row - bh // 2, len(its) - bh))
+        for n, (s, i) in enumerate(its[start:start + bh]):
+            y, sel = body + n, start + n == self.row
+            base = (self.R if self.focus == 1 else self.R | self.D) if sel else 0
+            if sel:
+                self.fill(y, rx - 1, rw + 1, base)
+            if s in ("proc", "ctr"):
+                name = ("docker: " if s == "ctr" else "") + i["name"]
+                nw = min(max(rw - 50, 16), 36)
+                biggest = max([p["mem"] for p in self.live["procs"]] + [1])
+                line = f"{self.fit(name, nw):<{nw}} {kb(i['mem']):>9} {i['cpu']:>6.1f}%  "
+                self.put(y, rx, line, base | (self.B if sel else 0))
+                procs = f"{i['n']} procs " if s == "proc" and i["n"] > 1 else "container " if s == "ctr" else ""
+                self.put(y, rx + len(line), f"{procs:<11}", base | self.D)
+                self.put(y, rx + len(line) + 11, "▇" * max(1, int(i["mem"] / biggest * (rw - len(line) - 12))),
+                         base | self.ACC)
+                continue
+            tag = f" [{i['tag']}]" if i["tag"] else ""
+            note = " ✎" if self.notes.get(f"{s['id']}|{i['name']}") else ""
+            nw = min(len(i["name"]), max(rw // 2, 20))
+            self.put(y, rx, self.fit(i["name"], nw), base | self.B)
+            self.put(y, rx + nw, tag + note, base | self.D | (self.ACC if note else 0))
+            used_w = nw + len(tag) + len(note) + 2
+            extra = (f"{s['title']} · " if self.query else "") + "  ".join(x for x in (i["detail"], i["when"]) if x)
+            self.put(y, rx + used_w, self.fit(extra, rw - used_w), base | self.D)
+        self.fill(h - 1, 0, w, self.R)
+        self.put(h - 1, 1, self.fit(self.msg or self.HELP, w - 2), self.R)
+        self.scr.refresh()
+
+    def pager(self, title, lines, keys="Esc back", handler=None):
+        """Scrollable full-screen text: lines are (text, attr). handler(key) returns True to close."""
+        off = 0
+        while True:
+            self.scr.erase()
+            h, w = self.size()
+            self.put(0, 1, title, self.ACC | self.B)
+            self.put(1, 0, "─" * w, self.D)
+            view = h - 3
+            off = max(0, min(off, len(lines) - view))
+            for n, (text, attr) in enumerate(lines[off:off + view]):
+                self.put(2 + n, 1, text, attr, w - 2)
+            self.fill(h - 1, 0, w, self.R)
+            more = f"  ({off + 1}-{min(off + view, len(lines))} of {len(lines)})" if len(lines) > view else ""
+            self.put(h - 1, 1, keys + "  ↑↓ scroll" + more, self.R)
+            self.scr.refresh()
+            k = self.scr.getch()
+            if k in (27, ord("q"), self.c.KEY_LEFT, ord("h")):
+                return None
+            if k in (self.c.KEY_DOWN, ord("j")):
+                off += 1
+            elif k in (self.c.KEY_UP, ord("k")):
+                off -= 1
+            elif k in (self.c.KEY_NPAGE, ord(" ")):
+                off += view - 1
+            elif k == self.c.KEY_PPAGE:
+                off -= view - 1
+            elif k == self.c.KEY_RESIZE:
+                continue
+            elif handler and k != -1:
+                r = handler(k)
+                if r is not None:
+                    return r
+
+    def wrap(self, text, attr=0, indent="  "):
+        width = max(self.size()[1] - 4 - len(indent), 20)
+        out = []
+        for para in str(text).splitlines() or [""]:
+            while len(para) > width:
+                cut = para.rfind(" ", 0, width)
+                cut = cut if cut > width // 2 else width
+                out.append((indent + para[:cut], attr))
+                para = para[cut:].lstrip()
+            out.append((indent + para, attr))
+        return out
+
+    def info_lines(self, a, s=None, i=None):
+        L = []
+        risk = a.get("risk") or {}
+        if risk.get("text"):
+            L += [(risk["label"], self.RISK.get(risk["level"], 0))] + self.wrap(risk["text"])
+        if i:
+            note = self.notes.get(f"{s['id']}|{i['name']}")
+            if note:
+                L += [("", 0), ("Your note", self.B)] + self.wrap("✎ " + note, self.ACC)
+
+        def blk(title, rows_, attr=0):
+            rows_ = [r for r in rows_ if r]
+            if rows_:
+                L.append(("", 0))
+                L.append((title, self.B))
+                for r in rows_:
+                    L.extend(self.wrap(r, attr))
+        blk("What it is", [a.get("what") or "No description found on this machine. Press e to ask an AI."])
+        blk("Cost to your machine", [a.get("resource")])
+        blk("How to use it", ["$ " + x for x in a.get("hints", [])], self.ACC)
+        blk("You installed it with", ["$ " + x for x in a.get("installed_with", [])], self.ACC)
+        width = max((len(k) for k, _ in a.get("facts", [])), default=0)
+        blk("Details", [f"{k.ljust(width)}  {v}" for k, v in a.get("facts", [])])
+        if a.get("usage"):
+            blk(a["usage_title"], a["usage"].splitlines(), self.D)
+        blk("Also shows up as", [f"{r['section']}: {r['name']}" for r in a.get("related", [])])
+        return L
+
+    def open_item(self, s, i):
+        if s in ("proc", "ctr"):
+            key = ("docker: " if s == "ctr" else "") + i["name"]
+            a = proc_about(key)
+            if a.get("redirect"):
+                hit = next(((s2, i2) for s2, i2 in rows(self.inv) if i2["iid"] == a["redirect"]), None)
+                return self.open_item(*hit) if hit else None
+
+            def on_key(k):
+                if k == ord("s"):
+                    self.stop_group(key, a)
+                    return True
+            return self.pager(key, self.info_lines(a), "Esc back  s stop it", on_key)
+        a = about(i["iid"])
+
+        def on_key(k):
+            if k == ord("a"):
+                return self.actions(s, i, a) or None
+            if k == ord("e"):
+                self.explain(i)
+            elif k == ord("n"):
+                self.note(s, i)
+                return True
+            elif k == ord("H") and a.get("help_cmd"):
+                self.outside(lambda: print(run_help(a["help_cmd"])["text"]))
+        keys = "Esc back  a actions  e explain with AI  n note" + ("  H run --help" if a.get("help_cmd") else "")
+        return self.pager(f"{i['name']}  ·  {s['title']}", self.info_lines(a, s, i), keys, on_key)
+
+    def menu(self, title, options):
+        """A pick-one list; returns the index or None."""
+        sel = 0
+        while True:
+            h, w = self.size()
+            bw = min(max([len(o) for o in options] + [len(title)]) + 6, w - 4)
+            bh = min(len(options) + 4, h - 2)
+            y0, x0 = (h - bh) // 2, (w - bw) // 2
+            for y in range(bh):
+                self.fill(y0 + y, x0, bw, self.R)
+            self.put(y0 + 1, x0 + 2, title, self.R | self.B, bw - 4)
+            start = max(0, sel - (bh - 5))
+            for n, opt in enumerate(options[start:start + bh - 4]):
+                attr = self.ACC | self.B if start + n == sel else self.R
+                self.fill(y0 + 2 + n, x0 + 1, bw - 2, attr if start + n != sel else 0)
+                self.put(y0 + 2 + n, x0 + 2, self.fit(opt, bw - 4), attr)
+            self.scr.refresh()
+            k = self.scr.getch()
+            if k in (self.c.KEY_DOWN, ord("j")):
+                sel = (sel + 1) % len(options)
+            elif k in (self.c.KEY_UP, ord("k")):
+                sel = (sel - 1) % len(options)
+            elif k in (10, 13, self.c.KEY_ENTER, self.c.KEY_RIGHT):
+                return sel
+            elif ord("1") <= k <= ord("9") and k - ord("1") < len(options):
+                return k - ord("1")
+            elif k in (27, ord("q"), self.c.KEY_LEFT):
+                return None
+
+    def actions(self, s, i, a=None):
+        acts = [x for x in (i["actions"] if i else s["actions"]) if x["kind"] != "copy"]
+        if not acts:
+            self.msg = "No actions for this."
+            return None
+        k = self.menu(f"Actions: {i['name'] if i else s['title']}",
+                      [f"{n}. {x['label']}{' …' if x['danger'] else ''}" for n, x in enumerate(acts, 1)])
+        if k is None:
+            return None
+        act_ = acts[k]
+        what = i["name"] if i else s["title"]
+        if act_["kind"] == "open":
+            self.msg = "Opened." if run_action(act_["id"])["ok"] else "Could not open it."
+            return None
+        risk = (a or about(i["iid"]))["risk"] if i else None
+        L = []
+        if risk and risk.get("text"):
+            L += [(risk["label"], self.RISK.get(risk["level"], 0))] + self.wrap(risk["text"])
+        for title, text in (("What will happen", act_["impact"]),
+                            ("How to undo", f"{act_['undo']['label']}: {act_['undo']['cmd']}" if act_.get("undo") else
+                             "There is no automatic undo for this." if act_["danger"] else "")):
+            if text:
+                L += [("", 0), (title, self.B)] + self.wrap(text)
+        if act_.get("preview"):
+            out = run_action(act_["preview"])["output"]
+            gone = re.findall(r"^Remv (\S+)", out, re.M)
+            L += [("", 0), (f"This removes {len(gone)} packages" if len(gone) > 1 else "Dry run", self.RED | self.B if len(gone) > 1 else self.B)]
+            L += [("  " + g, 0) for g in gone] or self.wrap("\n".join(out.splitlines()[-12:]), self.D)
+        L += [("", 0), ("Command", self.B)] + self.wrap("$ " + act_["cmd"], self.ACC)
+        critical = act_["danger"] and risk and risk["level"] == "critical"
+        if act_["confirm"]:
+            keys = "Esc cancel  Y type yes to run (system-critical)" if critical else "Esc cancel  y run it"
+            go = self.pager(f"{act_['label']} — {what}", L, keys,
+                            lambda key: True if key in (ord("y"), ord("Y")) else None)
+            if not go:
+                return None
+            if critical and (self.ask_line(f"Type yes to confirm ({risk['ack']}): ") or "").lower() != "yes":
+                self.msg = "Cancelled."
+                return None
+        result = {}
+
+        def run_it():
+            print(bold(f"{act_['label']} — {what}"))
+            print(dim("$ " + act_["cmd"]) + "\n")
+            result.update(run_action(act_["id"], what, live=True))
+            print(Term.c("32;1", "\nDone.") if result["ok"] else Term.c("31;1", f"\nFailed (exit code {result['code']}). {result['output']}"))
+            if result["ok"] and act_.get("undo"):
+                print(dim(f"Undo: {act_['undo']['cmd']}"))
+        self.outside(run_it)
+        if result.get("ok") and act_["refresh"]:
+            self.rescan()
+        return True
+
+    def explain(self, i):
+        provs, local = ai_providers(), local_model()
+        targets = [(p["name"], k) for k, p in enumerate(provs)] + ([(f"{local['model']} (local)", None)] if local.get("model") else [])
+        if not targets:
+            self.msg = f"No AI set up. Add one in {short(AI_FILE)}, or install Ollama."
+            return
+        k = 0 if len(targets) == 1 else self.menu("Explain with", [t[0] for t in targets])
+        if k is not None:
+            self.outside(lambda: answer_in_terminal(i["iid"], targets[k][1]))
+
+    def note(self, s, i):
+        key = f"{s['id']}|{i['name']}"
+        cur = self.notes.get(key, "")
+        text = self.ask_line(f"Note for {i['name']}" + (f" (now: {self.fit(cur, 30)}; empty clears)" if cur else "") + ": ")
+        if text is None:
+            return
+        self.notes = save_note(key, text)
+        self.msg = "Note saved." if text else "Note cleared."
+
+    def stop_group(self, key, a=None):
+        a = a or proc_about(key)
+        if not (key.startswith("docker: ") or (LIVE.group_pids.get(key) or {}).get("stoppable")):
+            self.msg = "Machine Map won't stop this: it's part of the desktop or owned by the system."
+            return
+        L = []
+        risk = a.get("risk") or {}
+        if risk.get("text"):
+            L += [(risk["label"], self.RISK.get(risk["level"], 0))] + self.wrap(risk["text"])
+        L += [("", 0), ("What will happen", self.B)] + self.wrap(
+            f"Runs docker stop {key[8:]}: the container stops and frees its RAM; nothing is deleted." if key.startswith("docker: ")
+            else "Sends a polite quit signal (SIGTERM) to every process in this group. " + a.get("stop_effect", ""))
+        if self.pager(f"Stop {key}?", L, "Esc cancel  y stop it", lambda k: True if k == ord("y") else None):
+            self.msg = LIVE.stop_group(key)["output"]
+
+    def run(self):
+        while True:
+            if time.time() - self.live_at > 2:
+                self.live, self.live_at = LIVE.sample(), time.time()
+            self.draw()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            its = self.items()
+            if k not in (-1, self.c.KEY_RESIZE):
+                self.msg = ""
+            if k in (ord("q"),):
+                return
+            if k == 27:  # Esc clears the search
+                self.query = ""
+            elif k in (9, self.c.KEY_RIGHT, ord("l")):
+                self.focus = 1
+            elif k in (self.c.KEY_BTAB, self.c.KEY_LEFT, ord("h")):
+                self.focus = 0
+            elif k in (self.c.KEY_DOWN, ord("j"), self.c.KEY_UP, ord("k"), self.c.KEY_NPAGE, self.c.KEY_PPAGE,
+                       self.c.KEY_HOME, self.c.KEY_END, ord("g"), ord("G")):
+                step = {self.c.KEY_DOWN: 1, ord("j"): 1, self.c.KEY_UP: -1, ord("k"): -1, self.c.KEY_NPAGE: 15,
+                        self.c.KEY_PPAGE: -15, self.c.KEY_HOME: -10**6, ord("g"): -10**6, self.c.KEY_END: 10**6,
+                        ord("G"): 10**6}[k]
+                if self.focus == 0 and not self.query:
+                    self.sec = max(0, min(self.sec + step, len(self.entries) - 1))
+                    self.row = 0
+                else:
+                    self.row = max(0, min(self.row + step, len(its) - 1))
+            elif k in (10, 13, self.c.KEY_ENTER):
+                if self.focus == 0 and not self.query:
+                    self.focus = 1
+                elif its:
+                    self.open_item(*its[self.row])
+            elif k == ord("/"):
+                q = self.ask_line("Search: ")
+                if q is not None:
+                    self.query, self.row, self.focus = q, 0, 1
+            elif k == ord("a") and its and its[self.row][0] not in ("proc", "ctr"):
+                self.actions(*its[self.row])
+            elif k == ord("A") and self.entries[self.sec] and not self.query:
+                self.actions(self.entries[self.sec][1], None)
+            elif k == ord("e") and its and its[self.row][0] not in ("proc", "ctr"):
+                self.explain(its[self.row][1])
+            elif k == ord("n") and its and its[self.row][0] not in ("proc", "ctr"):
+                self.note(*its[self.row])
+            elif k == ord("s") and its and its[self.row][0] in ("proc", "ctr"):
+                s, i = its[self.row]
+                self.stop_group(("docker: " if s == "ctr" else "") + i["name"])
+            elif k == ord("r"):
+                self.rescan()
+            elif k == ord("?"):
+                self.pager("Keys", [(l, 0) for l in (
+                    "↑ ↓ / j k      move            PgUp PgDn, g G   jump",
+                    "← → / Tab      switch between sections and items",
+                    "Enter          open: what it is, how to use it, is it safe to remove",
+                    "a              actions for the item (start, stop, update, remove…)",
+                    "A              bulk actions for the whole section (e.g. update all)",
+                    "e              explain it with an AI (Ollama, Claude, or ai.json)",
+                    "n              add or change your note",
+                    "s              stop a process or container (in Live: memory by app)",
+                    "/  Esc         search everything / clear the search",
+                    "r              rescan the machine",
+                    "q              quit",
+                    "",
+                    "Actions leave the full screen to run, so you see their output and any password prompt.")])
+
+
+def cmd_tui(args):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("The TUI needs an interactive terminal. For scripts, use: machinemap list / search / info")
+    import curses
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+    inv = load_inventory()
+    os.environ.setdefault("ESCDELAY", "25")  # Esc reacts at once instead of after a second
+    curses.wrapper(lambda scr: TUI(scr, inv).run())
+
+
 def cmd_section(name):
     def run_it(args):
         args.sections, args.all = [name], False
@@ -2920,7 +3426,7 @@ def cli(argv):
     ap = argparse.ArgumentParser(
         prog="machinemap", formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Everything installed and running on this machine. With no command, opens the dashboard.",
-        epilog="examples:\n  machinemap list docker\n  machinemap search scraper\n  machinemap info ollama\n"
+        epilog="examples:\n  machinemap tui\n  machinemap list docker\n  machinemap search scraper\n  machinemap info ollama\n"
                "  machinemap top --watch 2\n  machinemap do twenty-server-1 Stop\n  machinemap ask lsd --with local\n"
                "  machinemap note copyq \"clipboard history, keep it\"\n  machinemap updates")
     ap.add_argument("--no-open", action="store_true", help="start the dashboard server without opening a browser")
@@ -2933,6 +3439,8 @@ def cli(argv):
             sp.add_argument("--json", action="store_true", help="machine-readable output")
         return sp
 
+    sp = sub_.add_parser("tui", help="full-screen terminal app: browse, explain and manage everything")
+    sp.set_defaults(fn=cmd_tui)
     sp = add("list", cmd_list, "sections and their items (e.g. list docker ports)")
     sp.add_argument("sections", nargs="*", help="docker, ports, npm, apt, claude, repos, cleanup, updates… (see list)")
     sp.add_argument("--all", action="store_true", help="every section")
