@@ -93,9 +93,12 @@ Your notes, the log of things you removed, and saved explanations live in `~/.co
 
 ## Security
 
-The server listens on `127.0.0.1` only. Every API request needs a random token created at launch, and requests are refused if they carry another site's `Host`, `Origin` or `Sec-Fetch-Site`, so web pages you visit can't trigger actions. The page can't be framed by other sites.
-
-The browser never sends a command line, only the id of an action the server generated itself. Admin actions go through `pkexec`, so your desktop asks for your password each time.
+- **Only you can open it.** The server listens on `127.0.0.1` only, but other accounts on the machine (and containers using host networking) can reach that too. So the page opens only through the link the launcher makes: it carries a secret kept in a file only you can read (`$XDG_RUNTIME_DIR/machinemap-7171.token`), which your browser then keeps as a cookie. Every API request needs that secret as well.
+- **Websites can't use it.** Requests carrying another site's `Host`, `Origin` or `Sec-Fetch-Site` are refused, and the page can't be framed by other sites.
+- **It never runs your programs on its own.** Usage notes come from `tldr`, man pages or a script's own comments. A program's `--help` runs only when you press the button for it, since a program may ignore `--help` and just run.
+- **Secrets stay hidden.** Passwords, tokens and API keys in your shell history, process command lines and MCP configs are shown as `•••`. They're masked again in anything sent to an AI.
+- **AI answers can't take actions.** Facts sent to an AI are marked as data to describe, never instructions, and the built-in Claude CLI provider runs with tools turned off. If you add your own `command` provider, use one with tools disabled too, because READMEs from repos you cloned end up in the prompt.
+- **The page only sends ids.** It never sends a command line, only the id of an action the server built itself. Admin actions go through `pkexec`, so your desktop asks for your password each time.
 
 Found a problem? Please open an issue.
 
