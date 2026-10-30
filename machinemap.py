@@ -2922,18 +2922,47 @@ class TUI:
         curses.curs_set(0)
         scr.keypad(True)
         scr.timeout(1000)
-        try:
-            curses.use_default_colors()
-            for n, col in enumerate((curses.COLOR_CYAN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_GREEN), 1):
-                curses.init_pair(n, col, -1)
-            self.ACC, self.RED, self.YEL, self.GRN = (curses.color_pair(n) for n in range(1, 5))
-        except curses.error:
-            self.ACC = self.RED = self.YEL = self.GRN = 0
         self.B, self.D, self.R = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
+        self.palette()
         self.RISK = {"critical": self.RED | self.B, "caution": self.YEL | self.B, "safe": self.GRN | self.B, "info": self.D}
         self.focus, self.sec, self.row, self.query, self.msg = 0, 0, 0, "", ""
         self.live, self.live_at = LIVE.sample(), 0
         self.reload(inv)
+
+    def palette(self):
+        """A 256-color theme when the terminal has it, the 8 basic colors otherwise, bold/reverse with none."""
+        c, B, D, R = self.c, self.B, self.D, self.R
+        theme = {"ACC": B, "GRP": B, "RED": B, "YEL": B, "GRN": 0, "MUT": D, "SEL": R, "SELD": R | D, "BAR": R,
+                 "BOX": R, "SEG": [R]}
+        try:
+            c.start_color()
+            c.use_default_colors()
+            rich = c.COLORS >= 256
+            if rich:  # sky, violet, coral, amber, mint, grey; deep blue selection
+                acc, grp, red, yel, grn, mut, ink = 117, 141, 210, 221, 114, 246, 255
+                sel, seld, bar, box, segs, dark = 25, 238, 24, 236, (75, 141, 114, 221, 209), 234
+            else:
+                acc, grp, red, yel, grn, mut, ink = c.COLOR_CYAN, c.COLOR_MAGENTA, c.COLOR_RED, c.COLOR_YELLOW, \
+                    c.COLOR_GREEN, -1, c.COLOR_WHITE
+                sel, seld, bar, box, dark = c.COLOR_BLUE, c.COLOR_BLACK, c.COLOR_BLUE, c.COLOR_BLACK, c.COLOR_BLACK
+                segs = (c.COLOR_BLUE, c.COLOR_MAGENTA, c.COLOR_GREEN, c.COLOR_YELLOW, c.COLOR_CYAN)
+            n = iter(range(1, 64))
+
+            def pair(fg, bg=-1):
+                k = next(n)
+                c.init_pair(k, fg, bg)
+                return c.color_pair(k)
+            theme = {"ACC": pair(acc), "GRP": pair(grp), "RED": pair(red), "YEL": pair(yel), "GRN": pair(grn),
+                     "MUT": pair(mut) if rich else D, "SEL": pair(ink, sel), "SELD": pair(ink, seld),
+                     "BAR": pair(ink, bar), "BOX": pair(ink, box), "SEG": [pair(dark, x) for x in segs]}
+        except c.error:
+            pass
+        for k, v in theme.items():
+            setattr(self, k, v)
+
+    def heat(self, share):
+        """Green, amber or coral by how much of all RAM something uses."""
+        return self.RED if share > .10 else self.YEL if share > .04 else self.GRN
 
     # ---- drawing helpers
     def size(self):
@@ -2960,8 +2989,8 @@ class TUI:
     def ask_line(self, prompt, initial=""):
         """A one-line text prompt at the bottom of the screen."""
         h, w = self.size()
-        self.fill(h - 1, 0, w, self.R)
-        self.put(h - 1, 0, prompt, self.R | self.B)
+        self.fill(h - 1, 0, w, self.BAR)
+        self.put(h - 1, 0, prompt, self.BAR | self.B)
         self.c.echo()
         self.c.curs_set(1)
         self.scr.timeout(-1)
@@ -3023,7 +3052,7 @@ class TUI:
         d = self.live
         used = d["mem_total"] - d["mem_avail"]
         kb = lambda k: fmt_mb(k // 1024)
-        self.put(0, 1, "Machine Map", self.ACC | self.B)
+        self.put(0, 1, "Machine Map", self.GRP | self.B)
         x = 14
         for label, val, pct in (("CPU", f"{d['cpu']:.0f}%", d["cpu"]),
                                 ("Swap", kb(d["swap_total"] - d["swap_free"]), 0),
@@ -3032,7 +3061,7 @@ class TUI:
                                 ("Load", " ".join(d["load"]), 0)):
             if val and x + len(label) + len(val) + 3 < w:
                 self.put(0, x, label, self.D)
-                self.put(0, x + len(label) + 1, val, self.B | (self.RED if pct > 85 else self.YEL if pct > 65 else 0))
+                self.put(0, x + len(label) + 1, val, self.B | (self.RED if pct > 85 else self.YEL if pct > 65 else self.ACC))
                 x += len(label) + len(val) + 4
         # where the RAM goes: one bar, biggest apps first
         cap = f" {kb(used)} of {kb(d['mem_total'])} RAM used "
@@ -3043,7 +3072,7 @@ class TUI:
             n = int(p["mem"] / d["mem_total"] * bw)
             if n >= 1:
                 seg = self.fit(" " + p["name"], n) if n > 4 else ""
-                self.put(1, bx + shown, seg.ljust(n), self.R | (self.ACC if k % 2 == 0 else 0))
+                self.put(1, bx + shown, seg.ljust(n), self.SEG[k % len(self.SEG)])
                 shown += n
         rest = int(used / d["mem_total"] * bw) - shown
         self.put(1, bx + shown, "▒" * max(rest, 0), self.D)
@@ -3060,15 +3089,16 @@ class TUI:
                 continue
             if e[0] != last:
                 lines.append(("", None, 0))
-                lines.append((e[0], None, self.ACC | self.B))
+                lines.append((e[0], None, self.GRP | self.B))
                 last = e[0]
             lines.append((f" {self.fit(e[1]['title'], lw - 8):<{lw - 7}}{len(e[1]['items']):>4}", k, self.D if not e[1]["items"] else 0))
         sel_line = next((n for n, l in enumerate(lines) if l[1] == self.sec), 0)
         start = max(0, min(sel_line - height // 2, len(lines) - height))
         for n, (text, idx, attr) in enumerate(lines[start:start + height]):
             if idx == self.sec and not self.query:
-                self.fill(top + n, 0, lw, self.R if self.focus == 0 else self.R | self.D)
-                self.put(top + n, 0, text, (self.R if self.focus == 0 else self.R | self.D) | self.B, lw)
+                hl = self.SEL if self.focus == 0 else self.SELD
+                self.fill(top + n, 0, lw, hl)
+                self.put(top + n, 0, text, hl | self.B, lw)
             else:
                 self.put(top + n, 0, text, attr, lw)
         for y in range(top, h - 1):
@@ -3090,30 +3120,38 @@ class TUI:
         start = max(0, min(self.row - bh // 2, len(its) - bh))
         for n, (s, i) in enumerate(its[start:start + bh]):
             y, sel = body + n, start + n == self.row
-            base = (self.R if self.focus == 1 else self.R | self.D) if sel else 0
-            if sel:
-                self.fill(y, rx - 1, rw + 1, base)
+            base = (self.SEL if self.focus == 1 else self.SELD) if sel else 0
             if s in ("proc", "ctr"):
                 name = ("docker: " if s == "ctr" else "") + i["name"]
                 nw = min(max(rw - 50, 16), 36)
                 biggest = max([p["mem"] for p in self.live["procs"]] + [1])
-                line = f"{self.fit(name, nw):<{nw}} {kb(i['mem']):>9} {i['cpu']:>6.1f}%  "
-                self.put(y, rx, line, base | (self.B if sel else 0))
-                procs = f"{i['n']} procs " if s == "proc" and i["n"] > 1 else "container " if s == "ctr" else ""
-                self.put(y, rx + len(line), f"{procs:<11}", base | self.D)
-                self.put(y, rx + len(line) + 11, "▇" * max(1, int(i["mem"] / biggest * (rw - len(line) - 12))),
-                         base | self.ACC)
+                share = i["mem"] / d["mem_total"]
+                cols = nw + 1 + 9 + 1 + 7 + 2 + 11  # name, memory, CPU, procs: the bar starts after these
+                if sel:  # highlight the text columns only, so the bar keeps its own color
+                    self.fill(y, rx - 1, cols + 1, base)
+                self.put(y, rx, self.fit(name, nw), base | (self.B if sel else 0))
+                self.put(y, rx + nw + 1, f"{kb(i['mem']):>9}", base | self.B | (0 if sel else self.heat(share)))
+                self.put(y, rx + nw + 11, f"{i['cpu']:>6.1f}%", base | (0 if sel else self.YEL if i["cpu"] > 50 else self.MUT))
+                procs = f"{i['n']} procs" if s == "proc" and i["n"] > 1 else "container" if s == "ctr" else ""
+                self.put(y, rx + nw + 20, f"{procs:<11}", base | (0 if sel else self.MUT))
+                self.put(y, rx + cols, "█" * max(1, int(i["mem"] / biggest * (rw - cols - 1))), self.heat(share))
                 continue
+            if sel:
+                self.fill(y, rx - 1, rw + 1, base)
             tag = f" [{i['tag']}]" if i["tag"] else ""
             note = " ✎" if self.notes.get(f"{s['id']}|{i['name']}") else ""
             nw = min(len(i["name"]), max(rw // 2, 20))
             self.put(y, rx, self.fit(i["name"], nw), base | self.B)
-            self.put(y, rx + nw, tag + note, base | self.D | (self.ACC if note else 0))
+            t = i["tag"]
+            tag_col = self.GRN if t.startswith(("running", "installed", "on login")) else \
+                self.YEL if t.startswith(("open to network", "stopped", "removed")) else self.ACC
+            self.put(y, rx + nw, tag, base | (0 if sel else tag_col))
+            self.put(y, rx + nw + len(tag), note, (base if sel else self.GRP) | self.B)
             used_w = nw + len(tag) + len(note) + 2
             extra = (f"{s['title']} · " if self.query else "") + "  ".join(x for x in (i["detail"], i["when"]) if x)
-            self.put(y, rx + used_w, self.fit(extra, rw - used_w), base | self.D)
-        self.fill(h - 1, 0, w, self.R)
-        self.put(h - 1, 1, self.fit(self.msg or self.HELP, w - 2), self.R)
+            self.put(y, rx + used_w, self.fit(extra, rw - used_w), base | (0 if sel else self.MUT))
+        self.fill(h - 1, 0, w, self.BAR)
+        self.put(h - 1, 1, self.fit(self.msg or self.HELP, w - 2), self.BAR)
         self.scr.refresh()
 
     def pager(self, title, lines, keys="Esc back", handler=None):
@@ -3128,9 +3166,9 @@ class TUI:
             off = max(0, min(off, len(lines) - view))
             for n, (text, attr) in enumerate(lines[off:off + view]):
                 self.put(2 + n, 1, text, attr, w - 2)
-            self.fill(h - 1, 0, w, self.R)
+            self.fill(h - 1, 0, w, self.BAR)
             more = f"  ({off + 1}-{min(off + view, len(lines))} of {len(lines)})" if len(lines) > view else ""
-            self.put(h - 1, 1, keys + "  ↑↓ scroll" + more, self.R)
+            self.put(h - 1, 1, keys + "  ↑↓ scroll" + more, self.BAR)
             self.scr.refresh()
             k = self.scr.getch()
             if k in (27, ord("q"), self.c.KEY_LEFT, ord("h")):
@@ -3176,7 +3214,7 @@ class TUI:
             rows_ = [r for r in rows_ if r]
             if rows_:
                 L.append(("", 0))
-                L.append((title, self.B))
+                L.append((title, self.GRP | self.B))
                 for r in rows_:
                     L.extend(self.wrap(r, attr))
         blk("What it is", [a.get("what") or "No description found on this machine. Press e to ask an AI."])
@@ -3227,12 +3265,12 @@ class TUI:
             bh = min(len(options) + 4, h - 2)
             y0, x0 = (h - bh) // 2, (w - bw) // 2
             for y in range(bh):
-                self.fill(y0 + y, x0, bw, self.R)
-            self.put(y0 + 1, x0 + 2, title, self.R | self.B, bw - 4)
+                self.fill(y0 + y, x0, bw, self.BOX)
+            self.put(y0 + 1, x0 + 2, title, self.BOX | self.B, bw - 4)
             start = max(0, sel - (bh - 5))
             for n, opt in enumerate(options[start:start + bh - 4]):
-                attr = self.ACC | self.B if start + n == sel else self.R
-                self.fill(y0 + 2 + n, x0 + 1, bw - 2, attr if start + n != sel else 0)
+                attr = self.SEL | self.B if start + n == sel else self.BOX
+                self.fill(y0 + 2 + n, x0 + 1, bw - 2, attr)
                 self.put(y0 + 2 + n, x0 + 2, self.fit(opt, bw - 4), attr)
             self.scr.refresh()
             k = self.scr.getch()
