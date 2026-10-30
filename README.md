@@ -6,6 +6,7 @@ It's for the moment you think "I installed something for this last month… what
 
 ![The dashboard: live CPU, swap, disk and temperature, a bar showing which apps use your RAM, and the processes and Docker containers using memory right now](docs/dashboard.png)
 
+- **Dashboard and command line.** The same inventory, explanations and actions in your browser or your terminal.
 - **One file, no dependencies.** Python 3.9+ standard library only. No pip install, no Node, no Electron.
 - **Light.** The server idles at about 30 MB of RAM and quits on its own 3 minutes after you close the tab.
 - **Explains before it acts.** Every item has a "What is this?" panel: what it does, how to use it (from `tldr` or its own help), how you installed it (matched from your shell history), and whether removing it is safe, risky or system-critical.
@@ -33,8 +34,32 @@ python3 machinemap.py
 | --- | --- |
 | `machinemap` | Opens the dashboard in your browser |
 | `machinemap --no-open` | Starts the server without opening a browser |
-| `machinemap --print` | Prints the whole inventory as plain text; add `--disk` and `--updates` for more |
 | `MACHINEMAP_PORT=8080 machinemap` | Uses another port (default 7171) |
+
+### In the terminal
+
+Everything the dashboard does also works as a command, without opening a browser:
+
+```bash
+machinemap list                    # every section with its count
+machinemap list docker ports       # what's in those sections
+machinemap search scraper          # names, paths, tags and your notes
+machinemap info ollama             # what it is, how to use it, is it safe to remove
+machinemap top --watch 2           # live RAM and CPU by app, like a friendlier htop
+machinemap do twenty-server-1      # list its actions…
+machinemap do twenty-server-1 Stop # …and run one, by name or number
+machinemap ask lsd --with local    # explain it with your local Ollama model
+machinemap note copyq "clipboard history, keep it"
+machinemap updates                 # available updates (apt, flatpak, npm)
+machinemap cleanup                 # caches that are safe to clear, with sizes
+machinemap removed                 # what you removed, and how to get it back
+```
+
+- **Section names:** `docker`, `ports`, `services`, `startup`, `bin`, `pipx`, `npm`, `apt`, `flatpak`, `apps`, `extensions`, `claude`, `mcp`, `ollama`, `repos` or `history`.
+- **When a name matches several items,** it asks which one; add `--in SECTION` to narrow it down.
+- **`do`** shows the same risk warning, dry run and undo as the dashboard, then asks before running. `--yes` skips the question, except for system-critical items. Admin actions ask for your password in the terminal.
+- **For scripts:** `list`, `search`, `info` and `top` take `--json`. Plain output is one item per line when piped, so `grep` works.
+- **Colors:** set `NO_COLOR=1` to turn them off.
 
 In the page:
 

@@ -6,8 +6,8 @@ a few minutes after you close the tab.
 
   machinemap                      open the dashboard
   machinemap --no-open            start the server without opening a browser
-  machinemap --print [--disk] [--updates]
-                                  dump the inventory as plain text (pipe it into grep)
+  machinemap list|search|info|top|do|ask|note|updates|cleanup|removed …
+                                  the same things in the terminal (machinemap --help)
   MACHINEMAP_PORT=8080 machinemap use another port (default 7171)
 
 Actions (start/stop/update/uninstall…) are generated server-side: the page only ever sends an
@@ -188,15 +188,15 @@ def log_removal(a, what):
     write_json(REMOVED_FILE, log[:300])
 
 
-def run_action(aid, what=""):
-    result = _run_action(aid)
+def run_action(aid, what="", live=False):
+    result = _run_action(aid, live)
     a = ACTIONS.get(aid)
     if result["ok"] and a and a["danger"]:
         log_removal(a, what)
     return result
 
 
-def _run_action(aid):
+def _run_action(aid, live=False):
     a = ACTIONS.get(aid)
     if not a:
         return {"ok": False, "code": -1, "output": "Unknown action — press Rescan and try again."}
@@ -211,6 +211,12 @@ def _run_action(aid):
         subprocess.Popen(a["argv"], cwd=a["cwd"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)
         return {"ok": True, "code": 0, "output": ""}
+    if live:  # the terminal: output streams straight to it, and pkexec can ask for the password there
+        try:
+            p = subprocess.run(a["argv"], cwd=a["cwd"], env=env)
+        except FileNotFoundError as e:
+            return {"ok": False, "code": -1, "output": str(e)}
+        return {"ok": p.returncode == 0, "code": p.returncode, "output": ""}
     try:
         p = subprocess.run(a["argv"], cwd=a["cwd"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True, timeout=900)
@@ -2531,26 +2537,453 @@ def open_browser(url):
         webbrowser.open(url)
 
 
-def print_inventory():
-    data = scan_all()
-    if "--disk" in sys.argv:
-        data["groups"][-1]["sections"] += [scan_cleanup(), scan_disk()]
-    if "--updates" in sys.argv:
-        data["groups"][-1]["sections"].append(scan_updates())
-    notes = load_notes()
-    for g in data["groups"]:
+# ---------------------------------------------------------------- command line
+
+ALIASES = {
+    "docker": ["docker-containers", "docker-images", "docker-volumes"], "containers": ["docker-containers"],
+    "images": ["docker-images"], "volumes": ["docker-volumes"], "services": ["services"], "ports": ["ports"],
+    "startup": ["startup"], "autostart": ["startup"], "bin": ["cli-bin"], "cli": ["cli-bin"], "commands": ["cli-bin"],
+    "python": ["python-tools", "python-user"], "pipx": ["python-tools"], "uv": ["python-tools"], "pip": ["python-user"],
+    "npm": ["npm-global"], "apt": ["apt-history", "apt-local"], "deb": ["apt-local"], "flatpak": ["flatpak"],
+    "snap": ["snap"], "apps": ["flatpak", "snap", "apps-manual", "launchers"], "appimage": ["apps-manual"],
+    "extensions": ["editor-ext", "browser-ext"], "vscode": ["editor-ext"], "browser": ["browser-ext"],
+    "claude": ["claude-plugins", "claude-skills", "claude-mcp"], "plugins": ["claude-plugins"],
+    "skills": ["claude-skills"], "mcp": ["claude-mcp"], "ollama": ["ollama"], "models": ["ollama"],
+    "repos": ["repos"], "git": ["repos"], "history": ["history"], "removed": ["removed"],
+    "updates": ["updates"], "cleanup": ["cleanup"], "disk": ["disk"],
+}
+EXTRA_SCANS = {"updates": scan_updates, "cleanup": scan_cleanup, "disk": scan_disk}
+
+
+class Term:
+    color = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+    RISK = {"critical": "31", "caution": "33", "safe": "32", "info": "2"}
+
+    @classmethod
+    def c(cls, code, text):
+        return f"\x1b[{code}m{text}\x1b[0m" if cls.color and text else text
+
+
+bold, dim, cyan = (lambda t: Term.c("1", t)), (lambda t: Term.c("2", t)), (lambda t: Term.c("36", t))
+
+
+def die(msg, code=1):
+    sys.stdout.flush()
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def status(msg):
+    if sys.stderr.isatty():
+        print(dim(msg), file=sys.stderr)
+
+
+def load_inventory(extra=()):
+    """Scans like the dashboard does; `extra` adds the slow on-demand sections (updates, cleanup, disk)."""
+    status("Scanning your machine…")
+    inv = CACHE["inventory"] = scan_all()
+    for name in extra:
+        status(f"Checking {name}…" + (" (uses the network)" if name == "updates" else ""))
+        inv["groups"].append({"title": name, "sections": [EXTRA_SCANS[name]()]})
+    return inv
+
+
+def section_ids(names):
+    """'docker', 'docker-images' or a bit of a section title -> section ids."""
+    ids = []
+    for n in names:
+        n = n.lower()
+        if n in ALIASES:
+            ids += ALIASES[n]
+        else:
+            hit = [sid for t, group in GROUPS for sid in group if n == sid] or \
+                  [sid for sid in sum((g for _, g in GROUPS), []) if n in sid]
+            if not hit:
+                die(f"No section called '{n}'. Try one of: {', '.join(sorted(ALIASES))}")
+            ids += hit
+    return ids
+
+
+def rows(inv, only=None):
+    for g in inv["groups"]:
         for s in g["sections"]:
-            print(f"\n== {s['title']} ({len(s['items'])})")
-            for i in s["items"]:
-                note = notes.get(f"{s['id']}|{i['name']}", "")
-                print("  " + "  |  ".join(x for x in (i["name"], i["tag"], i["detail"], i["path"], i["when"],
-                                                      f"note: {note}" if note else "") if x))
+            if not only or s["id"] in only:
+                for i in s["items"]:
+                    yield s, i
+
+
+def show_items(s, items, notes):
+    cols = shutil.get_terminal_size((110, 20)).columns
+    print(bold(f"\n{s['title']}") + dim(f"  {len(items)}"))
+    for i in items:
+        tag = f" [{i['tag']}]" if i["tag"] else ""
+        rest = "  ".join(x for x in (i["detail"], i["path"], i["when"]) if x)
+        if sys.stdout.isatty():  # fit one line on screen; full lines when piped, for grep
+            room = cols - len(i["name"]) - len(tag) - 6
+            rest = "" if room < 12 else rest if len(rest) <= room else rest[:room - 1] + "…"
+        print(f"  {bold(i['name'])}{dim(tag)}" + (f"  {dim(rest)}" if rest else ""))
+        note = notes.get(f"{s['id']}|{i['name']}")
+        if note:
+            print("    " + cyan("✎ " + note))
+
+
+def as_json(data):
+    print(json.dumps(data, indent=1, ensure_ascii=False))
+
+
+def plain(i):
+    return {k: i[k] for k in ("name", "tag", "detail", "path", "when")}
+
+
+def cmd_list(args):
+    extra = [n for n in ("updates", "cleanup", "disk") if n in [x.lower() for x in args.sections]]
+    inv = load_inventory(extra)
+    notes = load_notes()
+    if not args.sections and not args.all:
+        if args.json:
+            return as_json({s["id"]: len(s["items"]) for _, s in ((g, s) for g in inv["groups"] for s in g["sections"])})
+        for g in inv["groups"]:
+            print(bold(g["title"]))
+            for s in g["sections"]:
+                print(f"  {len(s['items']):>4}  {s['title']}  " + dim(s["id"]))
+        print(dim("\nShow one:  machinemap list docker   (or ports, npm, apt, claude, repos, cleanup, updates…)"))
+        return
+    only = None if args.all else set(section_ids(args.sections))
+    secs = [s for g in inv["groups"] for s in g["sections"] if not only or s["id"] in only]
+    if args.json:
+        return as_json({s["id"]: [plain(i) for i in s["items"]] for s in secs})
+    for s in secs:
+        show_items(s, s["items"], notes)
+
+
+def cmd_search(args):
+    inv, notes, q = load_inventory(), load_notes(), " ".join(args.text).lower()
+    found = {}
+    for s, i in rows(inv):
+        hay = " ".join((i["name"], i["detail"], i["path"], i["tag"], s["title"], notes.get(f"{s['id']}|{i['name']}", "")))
+        if q in hay.lower():
+            found.setdefault(s["id"], (s, []))[1].append(i)
+    if args.json:
+        return as_json({sid: [plain(i) for i in its] for sid, (_, its) in found.items()})
+    if not found:
+        die(f"Nothing matches '{q}'.")
+    for s, its in found.values():
+        show_items(s, its, notes)
+
+
+def pick(inv, name, within=None, section_too=False):
+    """Finds one item by name: exact first, then partial. Asks which one when several match."""
+    only = set(section_ids(within)) if within else None
+    n = name.lower()
+    hits = [r for r in rows(inv, only) if r[1]["name"].lower() == n] or \
+           [r for r in rows(inv, only) if n in r[1]["name"].lower() and (only or r[0]["id"] != "history")]
+    if not hits and section_too and n in ALIASES | {sid: 0 for _, g in GROUPS for sid in g}:
+        secs = [s for g in inv["groups"] for s in g["sections"] if s["id"] in section_ids([n])]
+        return (secs[0], None) if secs else None
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        return None
+    print(f"'{name}' matches {len(hits)} things:")
+    for k, (s, i) in enumerate(hits[:30], 1):
+        print(f"  {k:>2}. {bold(i['name'])}  {dim(s['title'] + (' · ' + i['tag'] if i['tag'] else ''))}")
+    if not sys.stdin.isatty():
+        die("Be more specific, or add --in SECTION (e.g. --in docker).")
+    try:
+        choice = input("Which one? (number) ").strip()
+        return hits[int(choice) - 1]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        die("Cancelled.")
+
+
+def risk_line(r):
+    if not r or not r.get("text"):
+        return
+    print(Term.c(Term.RISK.get(r["level"], "2") + ";1", r["label"]) + "  " + r["text"])
+
+
+def block(title, lines):
+    lines = [l for l in lines if l]
+    if lines:
+        print(bold(f"\n{title}"))
+        for l in lines:
+            print(f"  {l}")
+
+
+def cmd_info(args):
+    inv = load_inventory([args.within[0]] if args.within and args.within[0] in EXTRA_SCANS else ())
+    hit = pick(inv, args.name, args.within)
+    if not hit:  # maybe it's a running process group (as in "top")
+        LIVE.sample()
+        time.sleep(0.3)
+        LIVE.sample()
+        key = next((k for k in LIVE.group_pids if k.lower() == args.name.lower()), None)
+        if not key:
+            die(f"Nothing called '{args.name}'. Try: machinemap search {args.name}")
+        a = proc_about(key)
+        s, i = None, None
+    else:
+        s, i = hit
+        a = about(i["iid"])
+    if args.json:
+        return as_json(a)
+    print(bold(a["title"]) + (dim(f"  {s['title']}" + (f" · {i['tag']}" if i["tag"] else "")) if s else dim("  running process")))
+    risk_line(a.get("risk"))
+    if i:
+        note = load_notes().get(f"{s['id']}|{i['name']}")
+        block("Your note", [cyan("✎ " + note)] if note else [])
+    block("What it is", [a.get("what") or "No description found on this machine. Try: machinemap ask " + args.name])
+    block("Cost to your machine", [a.get("resource")])
+    block("How to use it", ["$ " + h for h in a.get("hints", [])])
+    block("You installed it with", ["$ " + h for h in a.get("installed_with", [])])
+    width = max((len(k) for k, _ in a.get("facts", [])), default=0)
+    block("Details", [f"{dim(k.ljust(width))}  {v}" for k, v in a.get("facts", [])])
+    if a.get("usage"):
+        lines = a["usage"].splitlines()
+        block(a["usage_title"], lines if args.full else lines[:25] + ([dim(f"… {len(lines) - 25} more lines (--full)")] if len(lines) > 25 else []))
+    block("Also shows up as", [f"{r['section']}: {r['name']}" for r in a.get("related", [])])
+    if i and i["actions"]:
+        acts = [x for x in i["actions"] if x["kind"] != "copy"]
+        block("Actions", [f"{k}. " + (Term.c("31", x["label"]) if x["danger"] else x["label"]) for k, x in enumerate(acts, 1)]
+              + [dim(f"run one: machinemap do {shlex.quote(i['name'])} <number>")])
+    if a.get("help_cmd"):
+        print(dim(f"\nIts own help (runs it): {a['help_cmd']} --help"))
+
+
+def choose_action(acts, want):
+    if want.isdigit() and 1 <= int(want) <= len(acts):
+        return acts[int(want) - 1]
+    hits = [x for x in acts if x["label"].lower() == want.lower()] or [x for x in acts if want.lower() in x["label"].lower()]
+    if len(hits) != 1:
+        die(f"'{want}' matches {len(hits)} actions. Use the number from: machinemap do NAME")
+    return hits[0]
+
+
+def cmd_do(args):
+    within = args.within or ([args.name] if args.name.lower() in EXTRA_SCANS else None)
+    inv = load_inventory([w for w in (within or []) if w in EXTRA_SCANS])
+    hit = pick(inv, args.name, None if within == [args.name] else within, section_too=True)
+    if not hit:
+        die(f"Nothing called '{args.name}'. Try: machinemap search {args.name}")
+    s, i = hit
+    what = i["name"] if i else s["title"]
+    acts = [x for x in (i["actions"] if i else s["actions"]) if x["kind"] != "copy"]
+    if not acts:
+        die(f"{what} has no actions.")
+    if not args.action:
+        print(bold(what) + dim(f"  {s['title']}"))
+        for k, x in enumerate(acts, 1):
+            print(f"  {k:>2}. " + (Term.c("31", x["label"]) if x["danger"] else x["label"]) + dim(f"   $ {x['cmd']}"))
+        print(dim(f"\nRun one: machinemap do {shlex.quote(args.name)} <number>"))
+        return
+    a = choose_action(acts, " ".join(args.action))
+    if a["kind"] == "open":
+        r = run_action(a["id"])
+        return print("Opened." if r["ok"] else r["output"])
+    risk = about(i["iid"])["risk"] if i else None
+    print(bold(f"{a['label']} — {what}"))
+    risk_line(risk)
+    block("What will happen", [a["impact"]])
+    if a.get("undo"):
+        block("How to undo", [f"{a['undo']['label']}: {a['undo']['cmd']}  (also listed in: machinemap removed)"])
+    elif a["danger"]:
+        block("How to undo", ["There is no automatic undo for this."])
+    if a.get("preview"):
+        out = run_action(a["preview"])["output"]
+        gone = re.findall(r"^Remv (\S+)", out, re.M)
+        block(f"This removes {len(gone)} packages" if len(gone) > 1 else "Dry run", gone or out.splitlines()[-15:])
+    block("Command", ["$ " + a["cmd"]])
+    critical = a["danger"] and risk and risk["level"] == "critical"
+    if a["confirm"] and (critical or not args.yes):
+        if not sys.stdin.isatty():
+            die("\nNot running it: confirm in a terminal, or pass --yes (system-critical items always ask).")
+        prompt = f"\nType 'yes' to confirm ({risk['ack']}): " if critical else f"\n{'Remove it' if a['danger'] else 'Run it'}? [y/N] "
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer not in (("yes",) if critical else ("y", "yes")):
+            die("Cancelled.")
+    print()
+    r = run_action(a["id"], what, live=True)
+    print(Term.c("32;1", "\nDone.") if r["ok"] else Term.c("31;1", f"\nFailed (exit code {r['code']}). {r['output']}".rstrip()))
+    if r["ok"] and a.get("undo"):
+        print(dim(f"Undo: {a['undo']['cmd']}"))
+    sys.exit(0 if r["ok"] else 1)
+
+
+def cmd_ask(args):
+    provs = ai_providers()
+    local = local_model()
+    if args.list or not args.name:
+        for k, p in enumerate(ai_public()["providers"]):
+            print(f"  {bold(p['name'])}  {dim(p['where'])}")
+        if local.get("model"):
+            print(f"  {bold('local')}  {dim(local['model'] + ' via Ollama, runs on this machine')}")
+        if not provs and not local.get("model"):
+            print(f"No AI set up. Add one in {short(AI_FILE)} (see the README), or install Ollama.")
+        return
+    want = (args.with_ or "").lower()
+    if want == "local" or (not want and not provs):
+        if not local.get("model"):
+            die(f"No local model: {local.get('why')}")
+        target = None
+    else:
+        names = [p["name"].lower() for p in provs]
+        target = names.index(want) if want in names else next((k for k, n in enumerate(names) if want in n), None)
+        if target is None:
+            die(f"No AI called '{args.with_}'. See: machinemap ask --list")
+    inv = load_inventory()
+    hit = pick(inv, args.name, args.within)
+    if not hit:
+        die(f"Nothing called '{args.name}'. Try: machinemap search {args.name}")
+    iid = hit[1]["iid"]
+    status(f"Asking {local['model'] if target is None else provs[target]['name']}…" +
+           (" (loads it into RAM; the first words take a while on a laptop CPU)" if target is None else ""))
+
+    def write(t):
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    try:
+        if target is None:
+            stream_local(write, iid, args.fresh)
+        else:
+            stream_ai(write, iid, target, args.fresh)
+    except KeyboardInterrupt:
+        print(dim("\nStopped."))
+    finally:
+        if target is None:
+            stop_local()  # unload the model and free its RAM, even after Ctrl+C
+    print()
+
+
+def cmd_note(args):
+    inv = load_inventory()
+    hit = pick(inv, args.name, args.within)
+    if not hit:
+        die(f"Nothing called '{args.name}'.")
+    key = f"{hit[0]['id']}|{hit[1]['name']}"
+    if args.clear or args.text:
+        save_note(key, "" if args.clear else " ".join(args.text))
+        return print("Note removed." if args.clear else "Note saved.")
+    print(load_notes().get(key) or dim("No note yet. Add one: machinemap note NAME \"why it's installed\""))
+
+
+def cmd_top(args):
+    def frame():
+        d = LIVE.sample()
+        used, sw = d["mem_total"] - d["mem_avail"], d["swap_total"] - d["swap_free"]
+        kb = lambda k: fmt_mb(k // 1024)
+        print(f"{bold('CPU')} {d['cpu']:.0f}%   {bold('RAM')} {kb(used)} / {kb(d['mem_total'])}   {bold('Swap')} {kb(sw)}   "
+              f"{bold('Disk /')} {kb(d['disk_used'])} / {kb(d['disk_total'])}" + (f"   {bold('Temp')} {d['temp']:.0f}°C" if d["temp"] else "")
+              + f"   {bold('Load')} {' '.join(d['load'])}")
+        top = d["procs"][:args.n]
+        width = max([len(p["name"]) for p in top] + [len(c["name"]) + 2 for c in d["containers"]] + [20])
+        biggest = top[0]["mem"] if top else 1
+        print(dim(f"\n{'App or process group'.ljust(width)}  {'Memory':>9}  {'CPU':>6}"))
+        for p in top:
+            bar = "▇" * max(1, round(p["mem"] / biggest * 20))
+            print(f"{p['name'].ljust(width)}  {kb(p['mem']):>9}  {p['cpu']:>5.1f}%  {Term.c('36', bar)}"
+                  + dim(f"  {p['n']} procs" if p["n"] > 1 else ""))
+        if d["containers"]:
+            print(dim("\nDocker containers"))
+            for c in d["containers"]:
+                print(f"  {c['name'].ljust(width - 2)}  {kb(c['mem']):>9}  {c['cpu']:>5.1f}%")
+        return d
+    LIVE.sample()
+    time.sleep(0.5)
+    if args.json:
+        return as_json(LIVE.sample())
+    if not args.watch:
+        frame()
+        return
+    try:
+        while True:
+            sys.stdout.write("\x1b[H\x1b[J" if sys.stdout.isatty() else "\n")
+            frame()
+            print(dim(f"\nEvery {args.watch:g}s · Ctrl+C to quit"))
+            time.sleep(args.watch)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_section(name):
+    def run_it(args):
+        args.sections, args.all = [name], False
+        cmd_list(args)
+        print(dim(f"\nAct on one: machinemap do NAME --in {name}    run a bulk action: machinemap do {name}"))
+    return run_it
+
+
+def cli(argv):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="machinemap", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Everything installed and running on this machine. With no command, opens the dashboard.",
+        epilog="examples:\n  machinemap list docker\n  machinemap search scraper\n  machinemap info ollama\n"
+               "  machinemap top --watch 2\n  machinemap do twenty-server-1 Stop\n  machinemap ask lsd --with local\n"
+               "  machinemap note copyq \"clipboard history, keep it\"\n  machinemap updates")
+    ap.add_argument("--no-open", action="store_true", help="start the dashboard server without opening a browser")
+    sub_ = ap.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    def add(name, fn, help_, **kw):
+        sp = sub_.add_parser(name, help=help_, **kw)
+        sp.set_defaults(fn=fn)
+        if name not in ("top", "ask"):
+            sp.add_argument("--json", action="store_true", help="machine-readable output")
+        return sp
+
+    sp = add("list", cmd_list, "sections and their items (e.g. list docker ports)")
+    sp.add_argument("sections", nargs="*", help="docker, ports, npm, apt, claude, repos, cleanup, updates… (see list)")
+    sp.add_argument("--all", action="store_true", help="every section")
+    sp = add("search", cmd_search, "find items by name, path, tag or your notes")
+    sp.add_argument("text", nargs="+")
+    sp = add("info", cmd_info, "what it is, how to use it, and if it's safe to remove")
+    sp.add_argument("name")
+    sp.add_argument("--in", dest="within", nargs=1, help="only look in this section")
+    sp.add_argument("--full", action="store_true", help="show the whole manual/usage text")
+    sp = add("top", cmd_top, "what is using RAM and CPU right now")
+    sp.add_argument("-n", type=int, default=15, help="how many apps (default 15)")
+    sp.add_argument("--watch", type=float, nargs="?", const=2.0, metavar="SECONDS", help="keep refreshing")
+    sp.add_argument("--json", action="store_true")
+    sp = sub_.add_parser("do", help="start, stop, update, remove… (lists actions without one)")
+    sp.set_defaults(fn=cmd_do)
+    sp.add_argument("name", help="an item, or a section for its bulk actions (e.g. updates)")
+    sp.add_argument("action", nargs="*", help="number or name of the action")
+    sp.add_argument("--in", dest="within", nargs=1, help="only look in this section")
+    sp.add_argument("-y", "--yes", action="store_true", help="don't ask first (system-critical items still ask)")
+    sp = add("ask", cmd_ask, "explain an item with an AI (local Ollama, Claude, or ai.json)")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--with", dest="with_", metavar="AI", help="'local' or an AI's name (see --list)")
+    sp.add_argument("--in", dest="within", nargs=1)
+    sp.add_argument("--fresh", action="store_true", help="ignore the saved answer")
+    sp.add_argument("--list", action="store_true", help="show the AIs you can ask")
+    sp = add("note", cmd_note, "show or set your note on an item")
+    sp.add_argument("name")
+    sp.add_argument("text", nargs="*")
+    sp.add_argument("--in", dest="within", nargs=1)
+    sp.add_argument("--clear", action="store_true")
+    for name, help_ in (("updates", "available updates (apt, flatpak, npm; uses the network)"),
+                        ("cleanup", "caches and leftovers safe to clear, with sizes"),
+                        ("disk", "biggest folders in your home"),
+                        ("removed", "things you removed, with how to get them back")):
+        add(name, cmd_section(name), help_)
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        return False
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/grep -m
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+    return True
 
 
 def main():
-    if "--print" in sys.argv:
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # quiet exit when piped into head/grep -m
-        print_inventory()
+    if "--print" in sys.argv:  # older spelling of `machinemap list --all`
+        sys.argv = [sys.argv[0], "list", "--all"]
+    if len(sys.argv) > 1 and cli(sys.argv[1:]):
         return
     url = f"http://127.0.0.1:{PORT}/?t={TOKEN}"
     if already_running():
